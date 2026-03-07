@@ -22,10 +22,9 @@ class GeminiEmbeddingFunction(chromadb.EmbeddingFunction):
         
         # Use Gemini's embedding model with the new SDK
         result = client_genai.models.embed_content(
-            model='text-embedding-004', 
+            model='models/gemini-embedding-001', 
             contents=input
         )
-        # The result structure might differ, checking documentation/typical response
         return [embedding.values for embedding in result.embeddings]
 
 # Initialize ChromaDB
@@ -48,13 +47,18 @@ def add_book_to_vector_db(book_id: int, title: str, synopsis: str, genres: List[
     )
 
 def get_recommendations(user_preference_vector: List[float], n_results: int = 5, exclude_ids: List[str] = []):
-    if not api_key:
-        return []
+    if not api_key or collection.count() == 0:
+        return {"ids": [[]]}
     
+    # Chroma query
+    actual_n_results = min(n_results, collection.count())
+    if actual_n_results == 0:
+        return {"ids": [[]]}
+
     results = collection.query(
         query_embeddings=[user_preference_vector],
-        n_results=n_results,
-        where={"book_id": {"$notin": [int(id) for id in exclude_ids]}} if exclude_ids else None
+        n_results=actual_n_results,
+        where={"book_id": {"$nin": [int(id) for id in exclude_ids]}} if exclude_ids else None
     )
     return results
 
@@ -74,7 +78,7 @@ def calculate_user_vector(preferred_genres: List[str], preferred_authors: List[s
         pref_text += " I disliked books similar to: " + ", ".join([b['title'] for b in disliked_books])
 
     result = client_genai.models.embed_content(
-        model='text-embedding-004',
+        model='models/gemini-embedding-001',
         contents=pref_text
     )
     return result.embeddings[0].values

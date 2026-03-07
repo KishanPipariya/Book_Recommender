@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from typing import List
@@ -18,25 +19,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Book Recommender API", lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, restrict this to your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Book Recommender API"}
 
 @app.post("/users/", response_model=schemas.User)
 async def create_user(user: schemas.UserCreate, db: AsyncSession = Depends(database.get_db)):
-    db_user = models.User(username=user.username)
+    # Check if user exists
+    result = await db.execute(select(models.User).filter(models.User.username == user.username))
+    db_user = result.scalar_one_or_none()
     
-    # Fetch genres and authors to link
-    if user.preferred_genre_ids:
+    if not db_user:
+        db_user = models.User(username=user.username)
+        db.add(db_user)
+        await db.flush()
+    
+    # Fetch genres and authors to link (this updates preferences for existing users too)
+    if user.preferred_genre_ids is not None:
         result = await db.execute(select(models.Genre).filter(models.Genre.id.in_(user.preferred_genre_ids)))
         db_user.preferred_genres = result.scalars().all()
     
-    if user.preferred_author_ids:
+    if user.preferred_author_ids is not None:
         result = await db.execute(select(models.Author).filter(models.Author.id.in_(user.preferred_author_ids)))
         db_user.preferred_authors = result.scalars().all()
 
-    db.add(db_user)
-    await db.flush() # Ensure ID is generated
     user_id = db_user.id
     await db.commit()
     
@@ -62,9 +76,17 @@ async def create_interaction(user_id: int, interaction: schemas.InteractionCreat
         interaction_type=interaction.interaction_type
     )
     db.add(db_interaction)
+    await db.flush()
+    interaction_id = db_interaction.id
     await db.commit()
-    await db.refresh(db_interaction)
-    return db_interaction
+    
+    # Re-fetch the interaction if needed, although schemas.Interaction usually doesn't have deep relationships
+    # But to be safe and consistent with create_user:
+    result = await db.execute(
+        select(models.Interaction)
+        .filter(models.Interaction.id == interaction_id)
+    )
+    return result.scalar_one()
 
 @app.get("/recommendations/{user_id}", response_model=List[schemas.Book])
 async def get_recommendations_for_user(user_id: int, db: AsyncSession = Depends(database.get_db)):
@@ -90,24 +112,32 @@ async def get_recommendations_for_user(user_id: int, db: AsyncSession = Depends(
     # 3. Calculate user preference vector
     try:
         user_vector = recommendation.calculate_user_vector(pref_genres, pref_authors, interactions)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate user vector: {str(e)}")
 
     # 4. Get recommendations from ChromaDB
-    exclude_ids = [str(i.book_id) for i in user.interactions]
-    results = recommendation.get_recommendations(user_vector, n_results=5, exclude_ids=exclude_ids)
+    try:
+        exclude_ids = [str(i.book_id) for i in user.interactions]
+        results = recommendation.get_recommendations(user_vector, n_results=5, exclude_ids=exclude_ids)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to query recommendations: {str(e)}")
     
-    if not results or not results['ids']:
+    if not results or not results.get('ids') or not results['ids'][0]:
         return []
 
     # 5. Fetch full book details from DB for recommended IDs
-    book_ids = [int(id) for id in results['ids'][0]]
-    result = await db.execute(
-        select(models.Book)
-        .options(selectinload(models.Book.genres), selectinload(models.Book.authors))
-        .filter(models.Book.id.in_(book_ids))
-    )
-    recommended_books = result.scalars().all()
+    try:
+        book_ids = [int(id) for id in results['ids'][0]]
+        result = await db.execute(
+            select(models.Book)
+            .options(selectinload(models.Book.genres), selectinload(models.Book.authors))
+            .filter(models.Book.id.in_(book_ids))
+        )
+        recommended_books = result.scalars().all()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch book details: {str(e)}")
     
     # Sort by the order returned by ChromaDB
     book_map = {b.id: b for b in recommended_books}
