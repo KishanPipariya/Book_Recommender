@@ -16,6 +16,20 @@ if api_key:
     client_genai = genai.Client(api_key=api_key)
 
 class GeminiEmbeddingFunction(chromadb.EmbeddingFunction):
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def name() -> str:
+        return "GeminiEmbeddingFunction"
+
+    def get_config(self) -> Dict:
+        return {}
+
+    @classmethod
+    def build_from_config(cls, config: Dict) -> "GeminiEmbeddingFunction":
+        return cls()
+
     def __call__(self, input: List[str]) -> List[List[float]]:
         if not client_genai:
             raise ValueError("GOOGLE_API_KEY not set")
