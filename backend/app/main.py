@@ -1,67 +1,131 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List
+from typing import List, Optional
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
 from . import models, schemas, database, recommendation
 from sqlalchemy.orm import selectinload
 
+# Security config
+SECRET_KEY = "your-secret-key" # In production, use environment variable
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Create tables
     async with database.engine.begin() as conn:
         await conn.run_sync(models.Base.metadata.create_all)
     yield
-    # Shutdown: Clean up resources if needed
     await database.engine.dispose()
 
 app = FastAPI(title="Book Recommender API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the Book Recommender API"}
+async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(database.get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = schemas.TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+    
+    result = await db.execute(select(models.User).filter(models.User.username == token_data.username))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise credentials_exception
+    return user
 
-@app.post("/users/", response_model=schemas.User)
-async def create_user(user: schemas.UserCreate, db: AsyncSession = Depends(database.get_db)):
-    # Check if user exists
+@app.post("/signup", response_model=schemas.User)
+async def signup(user: schemas.UserCreate, db: AsyncSession = Depends(database.get_db)):
     result = await db.execute(select(models.User).filter(models.User.username == user.username))
-    db_user = result.scalar_one_or_none()
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Username already registered")
     
-    if not db_user:
-        db_user = models.User(username=user.username)
-        db.add(db_user)
-        await db.flush()
-    
-    # Fetch genres and authors to link (this updates preferences for existing users too)
-    if user.preferred_genre_ids is not None:
-        result = await db.execute(select(models.Genre).filter(models.Genre.id.in_(user.preferred_genre_ids)))
-        db_user.preferred_genres = result.scalars().all()
-    
-    if user.preferred_author_ids is not None:
-        result = await db.execute(select(models.Author).filter(models.Author.id.in_(user.preferred_author_ids)))
-        db_user.preferred_authors = result.scalars().all()
+    hashed_password = get_password_hash(user.password)
+    db_user = models.User(username=user.username, hashed_password=hashed_password)
+    db.add(db_user)
+    await db.commit()
+    await db.refresh(db_user)
+    return db_user
 
-    user_id = db_user.id
+@app.post("/token", response_model=schemas.Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(database.get_db)):
+    result = await db.execute(select(models.User).filter(models.User.username == form_data.username))
+    user = result.scalar_one_or_none()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/users/me", response_model=schemas.User)
+async def read_users_me(current_user: models.User = Depends(get_current_user)):
+    return current_user
+
+@app.post("/users/preferences", response_model=schemas.User)
+async def update_preferences(prefs: schemas.UserCreate, current_user: models.User = Depends(get_current_user), db: AsyncSession = Depends(database.get_db)):
+    if prefs.preferred_genre_ids is not None:
+        result = await db.execute(select(models.Genre).filter(models.Genre.id.in_(prefs.preferred_genre_ids)))
+        current_user.preferred_genres = result.scalars().all()
+    
+    if prefs.preferred_author_ids is not None:
+        result = await db.execute(select(models.Author).filter(models.Author.id.in_(prefs.preferred_author_ids)))
+        current_user.preferred_authors = result.scalars().all()
+
     await db.commit()
     
-    # Re-fetch with eager loading to avoid lazy loading issues in response serialization
+    # Eager reload
     result = await db.execute(
         select(models.User)
         .options(selectinload(models.User.preferred_genres), selectinload(models.User.preferred_authors))
-        .filter(models.User.id == user_id)
+        .filter(models.User.id == current_user.id)
     )
-    db_user = result.scalar_one()
-    return db_user
+    return result.scalar_one()
 
 @app.get("/books/", response_model=List[schemas.Book])
 async def read_books(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(database.get_db)):
@@ -69,9 +133,9 @@ async def read_books(skip: int = 0, limit: int = 100, db: AsyncSession = Depends
     return result.scalars().all()
 
 @app.post("/interactions/", response_model=schemas.Interaction)
-async def create_interaction(user_id: int, interaction: schemas.InteractionCreate, db: AsyncSession = Depends(database.get_db)):
+async def create_interaction(interaction: schemas.InteractionCreate, current_user: models.User = Depends(get_current_user), db: AsyncSession = Depends(database.get_db)):
     db_interaction = models.Interaction(
-        user_id=user_id,
+        user_id=current_user.id,
         book_id=interaction.book_id,
         interaction_type=interaction.interaction_type
     )
@@ -80,17 +144,12 @@ async def create_interaction(user_id: int, interaction: schemas.InteractionCreat
     interaction_id = db_interaction.id
     await db.commit()
     
-    # Re-fetch the interaction if needed, although schemas.Interaction usually doesn't have deep relationships
-    # But to be safe and consistent with create_user:
-    result = await db.execute(
-        select(models.Interaction)
-        .filter(models.Interaction.id == interaction_id)
-    )
+    result = await db.execute(select(models.Interaction).filter(models.Interaction.id == interaction_id))
     return result.scalar_one()
 
-@app.get("/recommendations/{user_id}", response_model=List[schemas.Book])
-async def get_recommendations_for_user(user_id: int, db: AsyncSession = Depends(database.get_db)):
-    # 1. Fetch user, their preferences and interactions
+@app.get("/recommendations/", response_model=List[schemas.Book])
+async def get_recommendations_for_user(current_user: models.User = Depends(get_current_user), db: AsyncSession = Depends(database.get_db)):
+    # 1. Re-fetch user with eager loaded relationships
     result = await db.execute(
         select(models.User)
         .options(
@@ -98,26 +157,22 @@ async def get_recommendations_for_user(user_id: int, db: AsyncSession = Depends(
             selectinload(models.User.preferred_authors),
             selectinload(models.User.interactions).joinedload(models.Interaction.book)
         )
-        .filter(models.User.id == user_id)
+        .filter(models.User.id == current_user.id)
     )
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = result.scalar_one()
 
-    # 2. Prepare preference data for embedding
+    # 2. Prepare preference data
     pref_genres = [g.name for g in user.preferred_genres]
     pref_authors = [a.name for a in user.preferred_authors]
     interactions = [{"title": i.book.title, "type": i.interaction_type} for i in user.interactions]
 
-    # 3. Calculate user preference vector
+    # 3. Calculate vector
     try:
         user_vector = recommendation.calculate_user_vector(pref_genres, pref_authors, interactions)
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate user vector: {str(e)}")
 
-    # 4. Get recommendations from ChromaDB
+    # 4. Query ChromaDB
     try:
         exclude_ids = [str(i.book_id) for i in user.interactions]
         results = recommendation.get_recommendations(user_vector, n_results=5, exclude_ids=exclude_ids)
@@ -127,18 +182,14 @@ async def get_recommendations_for_user(user_id: int, db: AsyncSession = Depends(
     if not results or not results.get('ids') or not results['ids'][0]:
         return []
 
-    # 5. Fetch full book details from DB for recommended IDs
-    try:
-        book_ids = [int(id) for id in results['ids'][0]]
-        result = await db.execute(
-            select(models.Book)
-            .options(selectinload(models.Book.genres), selectinload(models.Book.authors))
-            .filter(models.Book.id.in_(book_ids))
-        )
-        recommended_books = result.scalars().all()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch book details: {str(e)}")
+    # 5. Fetch full book details
+    book_ids = [int(id) for id in results['ids'][0]]
+    result = await db.execute(
+        select(models.Book)
+        .options(selectinload(models.Book.genres), selectinload(models.Book.authors))
+        .filter(models.Book.id.in_(book_ids))
+    )
+    recommended_books = result.scalars().all()
     
-    # Sort by the order returned by ChromaDB
     book_map = {b.id: b for b in recommended_books}
     return [book_map[bid] for bid in book_ids if bid in book_map]

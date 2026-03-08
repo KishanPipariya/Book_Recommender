@@ -167,6 +167,55 @@
   width: 100%;
 }
 
+.input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  text-align: left;
+}
+
+.input-group label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.text-btn {
+  background: none;
+  border: none;
+  color: var(--primary);
+  font-size: 0.9rem;
+  margin-top: 1rem;
+  padding: 0;
+  box-shadow: none;
+}
+
+.text-btn:hover {
+  background: none;
+  text-decoration: underline;
+}
+
+.error-box {
+  background: #fff1f2;
+  color: var(--danger);
+  padding: 1rem;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+  border: 1px solid #fecaca;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
 .loading-overlay {
   display: flex;
   flex-direction: column;

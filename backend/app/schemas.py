@@ -40,14 +40,22 @@ class UserBase(BaseModel):
     username: str
 
 class UserCreate(UserBase):
-    preferred_genre_ids: List[int]
-    preferred_author_ids: List[int]
+    password: str
+    preferred_genre_ids: Optional[List[int]] = []
+    preferred_author_ids: Optional[List[int]] = []
 
 class User(UserBase):
     id: int
     preferred_genres: List[Genre]
     preferred_authors: List[Author]
     model_config = ConfigDict(from_attributes=True)
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
 
 class InteractionCreate(BaseModel):
     book_id: int

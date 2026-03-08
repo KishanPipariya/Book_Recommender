@@ -38,6 +38,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
     
     preferred_genres = relationship("Genre", secondary=user_preferred_genres)
     preferred_authors = relationship("Author", secondary=user_preferred_authors)
